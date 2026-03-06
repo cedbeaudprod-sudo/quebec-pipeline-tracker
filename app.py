@@ -33,15 +33,15 @@ st.set_page_config(
 st.markdown("""
 <style>
     :root {
-        --bg-primary: #ffffff;
+        --bg-primary: #fdf7e8;
         --bg-secondary: #f8f9fb;
         --bg-card: #ffffff;
         --bg-elevated: #f3f4f6;
         --border-subtle: #e5e7eb;
         --border-accent: #d1d5db;
-        --text-primary: #111827;
-        --text-secondary: #4b5563;
-        --text-muted: #9ca3af;
+        --text-primary: #1e2977;
+        --text-secondary: #1e2977;
+        --text-muted: #1e2977;
         --accent-primary: #4f46e5;
         --accent-secondary: #6366f1;
         --accent-light: #eef2ff;
