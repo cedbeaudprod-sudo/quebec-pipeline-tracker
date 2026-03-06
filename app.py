@@ -138,6 +138,27 @@ def init_database():
         confidence TEXT, predicted_window TEXT, recommended_action TEXT, runway_score REAL, hiring_score REAL,
         growth_score REAL, market_score REAL, benchmark_score REAL, urgency_score REAL, primary_signals TEXT,
         all_signals TEXT, next_review_date TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS job_snapshots (
+        id INTEGER PRIMARY KEY, company_id TEXT, snapshot_date TEXT, total_jobs INTEGER DEFAULT 0,
+        senior_jobs INTEGER DEFAULT 0, tech_jobs INTEGER DEFAULT 0, growth_jobs INTEGER DEFAULT 0, other_jobs INTEGER DEFAULT 0,
+        indeed_count INTEGER DEFAULT 0, careers_page_count INTEGER DEFAULT 0, linkedin_count INTEGER DEFAULT 0,
+        job_titles TEXT, senior_roles_found TEXT, sources_checked TEXT, raw_data TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS job_postings (
+        id INTEGER PRIMARY KEY, company_id TEXT, title TEXT, location TEXT, source TEXT, url TEXT,
+        posted_date TEXT, scraped_date TEXT, role_type TEXT, is_senior INTEGER DEFAULT 0, raw_data TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS req_records (
+        id INTEGER PRIMARY KEY, company_id TEXT, neq TEXT, legal_name TEXT, operating_names TEXT,
+        legal_form TEXT, status TEXT, status_raw TEXT, incorporation_date TEXT, registered_address TEXT,
+        city TEXT, postal_code TEXT, directors TEXT, scian_codes TEXT, last_annual_update TEXT,
+        scraped_date TEXT, raw_data TEXT, validation_flags TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS req_directors (
+        id INTEGER PRIMARY KEY, company_id TEXT, neq TEXT, name TEXT, role TEXT,
+        start_date TEXT, end_date TEXT, is_current INTEGER DEFAULT 1, scraped_date TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS sred_signals (
+        id INTEGER PRIMARY KEY, company_id TEXT, scan_date TEXT, sred_mentioned INTEGER DEFAULT 0,
+        cdae_mentioned INTEGER DEFAULT 0, rd_jobs_count INTEGER DEFAULT 0, consultant_detected TEXT,
+        estimated_rd_spend REAL, estimated_rd_headcount INTEGER, rd_intensity_score REAL,
+        sector TEXT, sector_rd_benchmark REAL, signals TEXT, confidence TEXT, raw_data TEXT)""")
     conn.commit()
     conn.close()
 
@@ -1305,6 +1326,916 @@ def page_settings():
         st.download_button("📥 Export CSV", df.to_csv(index=False), "pipeline_export.csv", "text/csv")
 
 # ============================================================================
+# PAGE: JOBS INTELLIGENCE
+# ============================================================================
+
+def page_jobs():
+    st.markdown("# Jobs Intelligence")
+    st.markdown("Track hiring signals across your pipeline")
+    
+    try:
+        from connectors.jobs_scraper import JobsScraper, JobsAnalyzer
+        jobs_ok = True
+    except Exception as e:
+        jobs_ok = False
+        st.error(f"⚠️ Jobs module error: {str(e)}")
+    
+    tab1, tab2, tab3 = st.tabs(["📊 Hiring Dashboard", "🔍 Scan Company", "⚡ Batch Scan"])
+    
+    # TAB 1: HIRING DASHBOARD
+    with tab1:
+        st.markdown("### Hiring Activity Overview")
+        
+        conn = get_connection()
+        try:
+            df = pd.read_sql("""
+                SELECT 
+                    js.company_id,
+                    c.name,
+                    c.iq_sector,
+                    c.pipeline_stage,
+                    c.employees,
+                    js.total_jobs,
+                    js.senior_jobs,
+                    js.tech_jobs,
+                    js.growth_jobs,
+                    js.senior_roles_found,
+                    js.snapshot_date
+                FROM job_snapshots js
+                JOIN companies c ON js.company_id = c.company_id
+                WHERE js.id IN (
+                    SELECT MAX(id) FROM job_snapshots GROUP BY company_id
+                )
+                ORDER BY js.total_jobs DESC
+            """, conn)
+            df = clean_df(df)
+        except Exception as e:
+            df = pd.DataFrame()
+        conn.close()
+        
+        if len(df) == 0:
+            st.info("No job data yet. Use 'Scan Company' or 'Batch Scan' to collect hiring data.")
+        else:
+            # Summary metrics
+            col1, col2, col3, col4, col5 = st.columns(5)
+            with col1:
+                render_metric_card(len(df), "Companies Scanned")
+            with col2:
+                render_metric_card(int(df['total_jobs'].sum()), "Total Open Roles")
+            with col3:
+                render_metric_card(int(df['senior_jobs'].sum()), "Senior Roles")
+            with col4:
+                render_metric_card(int(df['tech_jobs'].sum()), "Tech Roles")
+            with col5:
+                render_metric_card(int(df['growth_jobs'].sum()), "Growth Roles")
+            
+            st.markdown("---")
+            
+            # Top hirers chart
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                top_hirers = df.nlargest(10, 'total_jobs')
+                fig = go.Figure(go.Bar(
+                    y=top_hirers['name'],
+                    x=top_hirers['total_jobs'],
+                    orientation='h',
+                    marker_color='#00875a',
+                    text=top_hirers['total_jobs'],
+                    textposition='inside',
+                    textfont=dict(color='white', size=12)
+                ))
+                fig.update_layout(
+                    title=dict(text="Top Hiring Companies", font=dict(color=NAVY, size=14)),
+                    paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+                    height=400, margin=dict(l=20, r=20, t=40, b=20),
+                    yaxis=dict(autorange='reversed', tickfont=dict(color=NAVY, size=11)),
+                    xaxis=dict(tickfont=dict(color=NAVY, size=11), gridcolor='#e5e7eb'),
+                    font_color=NAVY
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            
+            with col2:
+                # Senior hiring leaders
+                senior_hirers = df[df['senior_jobs'] > 0].nlargest(10, 'senior_jobs')
+                if len(senior_hirers) > 0:
+                    fig = go.Figure(go.Bar(
+                        y=senior_hirers['name'],
+                        x=senior_hirers['senior_jobs'],
+                        orientation='h',
+                        marker_color='#dc2626',
+                        text=senior_hirers['senior_jobs'],
+                        textposition='inside',
+                        textfont=dict(color='white', size=12)
+                    ))
+                    fig.update_layout(
+                        title=dict(text="🔴 Senior Role Hiring (Fundraising Signal)", font=dict(color=NAVY, size=14)),
+                        paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+                        height=400, margin=dict(l=20, r=20, t=40, b=20),
+                        yaxis=dict(autorange='reversed', tickfont=dict(color=NAVY, size=11)),
+                        xaxis=dict(tickfont=dict(color=NAVY, size=11), gridcolor='#e5e7eb'),
+                        font_color=NAVY
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                else:
+                    st.info("No senior roles detected yet")
+            
+            # Detailed table
+            st.markdown("### All Scanned Companies")
+            
+            display_df = df[['name', 'iq_sector', 'pipeline_stage', 'total_jobs', 'senior_jobs', 'tech_jobs', 'growth_jobs']].copy()
+            display_df.columns = ['Company', 'Sector', 'Pipeline', 'Total', 'Senior', 'Tech', 'Growth']
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
+            
+            # Senior roles detail
+            st.markdown("### Senior Roles Detected")
+            for _, row in df[df['senior_jobs'] > 0].iterrows():
+                try:
+                    roles_raw = row.get('senior_roles_found', '[]')
+                    if isinstance(roles_raw, bytes):
+                        roles_raw = roles_raw.decode('utf-8')
+                    roles = json.loads(roles_raw) if roles_raw else []
+                    if roles:
+                        st.markdown(f"**{row['name']}:** {', '.join(roles[:5])}")
+                except:
+                    pass
+    
+    # TAB 2: SCAN COMPANY
+    with tab2:
+        if not jobs_ok:
+            st.warning("Jobs module not available")
+            return
+        
+        st.markdown("### Scan Job Postings for a Company")
+        
+        conn = get_connection()
+        companies = clean_df(pd.read_sql("SELECT company_id, name, website, employees FROM companies ORDER BY name", conn))
+        conn.close()
+        
+        if len(companies) == 0:
+            st.info("Import companies first")
+            return
+        
+        opts = {r['name']: r['company_id'] for _, r in companies.iterrows()}
+        sel = st.selectbox("Select Company", list(opts.keys()))
+        cid = opts[sel]
+        c = get_company(cid)
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            website = safe_str(c.get('website')) if c is not None else ''
+            st.write(f"**Website:** {website or '—'}")
+        with col2:
+            employees = c.get('employees') if c is not None else 0
+            st.write(f"**Employees:** {employees or '—'}")
+        
+        careers_url = st.text_input("Careers Page URL (optional)", placeholder="e.g., https://company.com/careers")
+        
+        if st.button("🔍 Scan Jobs", type="primary"):
+            with st.spinner("Scanning job sources..."):
+                from connectors.jobs_scraper import JobsScraper, JobsAnalyzer
+                scraper = JobsScraper()
+                snapshot = scraper.collect_job_snapshot(cid, sel, website, careers_url or None)
+                
+                analyzer = JobsAnalyzer()
+                score = analyzer.get_hiring_score(cid, employees)
+            
+            st.success("✓ Scan complete!")
+            
+            # Results
+            col1, col2, col3, col4 = st.columns(4)
+            with col1: st.metric("Total Jobs Found", snapshot['summary']['total'])
+            with col2: st.metric("Senior Roles", snapshot['summary']['senior'])
+            with col3: st.metric("Tech Roles", snapshot['summary']['tech'])
+            with col4: st.metric("Growth Roles", snapshot['summary']['growth'])
+            
+            st.markdown("---")
+            
+            # Hiring score
+            st.markdown("### Hiring Score for Funding Radar")
+            st.metric("Hiring Signal Score", f"{score['score']}/100")
+            
+            if score['signals']:
+                st.markdown("**Signals Detected:**")
+                for sig in score['signals']:
+                    weight_color = {'high': '🔴', 'medium': '🟡', 'low': '🟢'}.get(sig.get('weight', 'low'), '⚪')
+                    st.markdown(f"{weight_color} **{sig['type'].replace('_', ' ').title()}**: {sig['detail']}")
+            
+            # Job listings
+            if snapshot['all_jobs']:
+                st.markdown("### Job Listings Found")
+                for job in snapshot['all_jobs'][:15]:
+                    senior_badge = "🔴 SENIOR" if job.get('is_senior') else ""
+                    role_type = job.get('role_type', 'other')
+                    type_badge = {'tech': '💻', 'growth': '📈', 'senior': '👔', 'other': '📋'}.get(role_type, '')
+                    st.markdown(f"• {type_badge} **{job['title']}** {senior_badge} — _{job.get('source', '')}_ {job.get('location', '')}")
+    
+    # TAB 3: BATCH SCAN
+    with tab3:
+        if not jobs_ok:
+            st.warning("Jobs module not available")
+            return
+        
+        st.markdown("### Batch Job Scan")
+        st.markdown("Scan multiple companies for hiring activity")
+        
+        conn = get_connection()
+        companies = clean_df(pd.read_sql("""
+            SELECT c.company_id, c.name, c.iq_sector, c.pipeline_stage, c.website, c.employees,
+                   (SELECT MAX(snapshot_date) FROM job_snapshots js WHERE js.company_id = c.company_id) as last_scan
+            FROM companies c 
+            ORDER BY c.name
+        """, conn))
+        conn.close()
+        
+        if len(companies) == 0:
+            st.info("Import companies first")
+            return
+        
+        # Filters
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            sectors = ["All"] + companies['iq_sector'].dropna().unique().tolist()
+            sel_sector = st.selectbox("Filter by Sector", sectors, key="jobs_batch_sector")
+        with col2:
+            pipelines = ["All"] + companies['pipeline_stage'].dropna().unique().tolist()
+            sel_pipeline = st.selectbox("Filter by Pipeline", pipelines, key="jobs_batch_pipeline")
+        with col3:
+            only_unscanned = st.checkbox("Only unscanned companies", value=True)
+        
+        filtered = companies.copy()
+        if sel_sector != "All":
+            filtered = filtered[filtered['iq_sector'] == sel_sector]
+        if sel_pipeline != "All":
+            filtered = filtered[filtered['pipeline_stage'] == sel_pipeline]
+        if only_unscanned:
+            filtered = filtered[filtered['last_scan'].isna()]
+        
+        st.write(f"**{len(filtered)} companies** match criteria")
+        
+        if len(filtered) > 0:
+            max_scan = st.slider("Companies to scan", 1, min(30, len(filtered)), min(10, len(filtered)))
+            
+            if st.button("🚀 Start Batch Scan", type="primary"):
+                from connectors.jobs_scraper import JobsScraper, JobsAnalyzer
+                scraper = JobsScraper()
+                
+                progress = st.progress(0)
+                status = st.empty()
+                results = []
+                
+                for idx, (_, company) in enumerate(filtered.head(max_scan).iterrows()):
+                    progress.progress((idx + 1) / max_scan)
+                    status.text(f"Scanning {idx + 1}/{max_scan}: {company['name']}")
+                    
+                    try:
+                        snapshot = scraper.collect_job_snapshot(
+                            company['company_id'],
+                            company['name'],
+                            company.get('website')
+                        )
+                        results.append({
+                            'name': company['name'],
+                            'total': snapshot['summary']['total'],
+                            'senior': snapshot['summary']['senior'],
+                            'tech': snapshot['summary']['tech'],
+                            'status': '✓'
+                        })
+                    except Exception as e:
+                        results.append({
+                            'name': company['name'],
+                            'total': 0,
+                            'senior': 0,
+                            'tech': 0,
+                            'status': f'✗ {str(e)[:20]}'
+                        })
+                
+                progress.progress(1.0)
+                status.text("Complete!")
+                
+                st.success(f"Scanned {len(results)} companies")
+                
+                results_df = pd.DataFrame(results).sort_values('total', ascending=False)
+                st.dataframe(results_df, hide_index=True)
+                
+                # Summary
+                total_jobs = sum(r['total'] for r in results)
+                total_senior = sum(r['senior'] for r in results)
+                st.markdown(f"**Found:** {total_jobs} total jobs, {total_senior} senior roles")
+
+# ============================================================================
+# PAGE: REQ VALIDATION
+# ============================================================================
+
+def page_req():
+    st.markdown("# 🏛️ REQ Validation")
+    st.markdown("Validate companies against the Registraire des entreprises du Québec")
+    
+    try:
+        from connectors.req_connector import REQConnector, REQAnalyzer
+        req_ok = True
+    except Exception as e:
+        req_ok = False
+        st.error(f"⚠️ REQ module error: {str(e)}")
+    
+    tab1, tab2, tab3 = st.tabs(["📊 Validation Dashboard", "🔍 Validate Company", "⚡ Batch Validate"])
+    
+    # TAB 1: DASHBOARD
+    with tab1:
+        st.markdown("### REQ Validation Status")
+        
+        conn = get_connection()
+        try:
+            df = pd.read_sql("""
+                SELECT 
+                    r.company_id,
+                    c.name,
+                    c.pipeline_stage,
+                    r.neq,
+                    r.legal_name,
+                    r.status,
+                    r.incorporation_date,
+                    r.legal_form,
+                    r.validation_flags,
+                    r.scraped_date
+                FROM req_records r
+                JOIN companies c ON r.company_id = c.company_id
+                WHERE r.id IN (
+                    SELECT MAX(id) FROM req_records GROUP BY company_id
+                )
+                ORDER BY r.scraped_date DESC
+            """, conn)
+            df = clean_df(df)
+        except Exception as e:
+            df = pd.DataFrame()
+        conn.close()
+        
+        if len(df) == 0:
+            st.info("No REQ validations yet. Use 'Validate Company' to start.")
+        else:
+            # Summary metrics
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                render_metric_card(len(df), "Companies Validated")
+            with col2:
+                active_count = len(df[df['status'] == 'active'])
+                render_metric_card(active_count, "Active in REQ")
+            with col3:
+                issues = len(df[df['status'].isin(['struck_off', 'dissolved', 'liquidating'])])
+                st.markdown(f"""<div class="metric-card"><div class="metric-value" style="color: {'#dc2626' if issues > 0 else '#00875a'}">{issues}</div><div class="metric-label">⚠️ Status Issues</div></div>""", unsafe_allow_html=True)
+            with col4:
+                with_neq = len(df[df['neq'].notna() & (df['neq'] != '')])
+                render_metric_card(with_neq, "NEQ Found")
+            
+            st.markdown("---")
+            
+            # Status breakdown
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                status_counts = df['status'].value_counts()
+                colors = {'active': '#00875a', 'struck_off': '#dc2626', 'dissolved': '#7f1d1d', 
+                         'liquidating': '#f59e0b', 'unknown': '#6b7280'}
+                fig = go.Figure(go.Pie(
+                    labels=status_counts.index,
+                    values=status_counts.values,
+                    marker_colors=[colors.get(s, '#6b7280') for s in status_counts.index],
+                    hole=0.4
+                ))
+                fig.update_layout(
+                    title=dict(text="Company Status Distribution", font=dict(color=NAVY, size=14)),
+                    paper_bgcolor='rgba(0,0,0,0)', height=350,
+                    font_color=NAVY, showlegend=True
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            
+            with col2:
+                # Companies with issues
+                issues_df = df[df['status'].isin(['struck_off', 'dissolved', 'liquidating'])]
+                if len(issues_df) > 0:
+                    st.markdown("### ⚠️ Companies with Issues")
+                    for _, row in issues_df.iterrows():
+                        status_emoji = {'struck_off': '🔴', 'dissolved': '⚫', 'liquidating': '🟠'}.get(row['status'], '⚪')
+                        st.markdown(f"{status_emoji} **{row['name']}** — {row['status'].replace('_', ' ').title()}")
+                else:
+                    st.success("✓ No status issues detected")
+            
+            # Full table
+            st.markdown("### All Validated Companies")
+            display_df = df[['name', 'neq', 'legal_name', 'status', 'incorporation_date', 'pipeline_stage']].copy()
+            display_df.columns = ['Company', 'NEQ', 'Legal Name', 'Status', 'Incorporated', 'Pipeline']
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
+    
+    # TAB 2: VALIDATE COMPANY
+    with tab2:
+        if not req_ok:
+            st.warning("REQ module not available")
+            return
+        
+        st.markdown("### Validate a Company")
+        st.markdown("Look up company in the Quebec corporate registry")
+        
+        conn = get_connection()
+        companies = clean_df(pd.read_sql("SELECT company_id, name FROM companies ORDER BY name", conn))
+        conn.close()
+        
+        if len(companies) == 0:
+            st.info("Import companies first")
+            return
+        
+        opts = {r['name']: r['company_id'] for _, r in companies.iterrows()}
+        sel = st.selectbox("Select Company", list(opts.keys()), key="req_company")
+        cid = opts[sel]
+        
+        known_neq = st.text_input("NEQ (if known)", placeholder="10 digits, e.g. 1234567890")
+        
+        if st.button("🔍 Validate in REQ", type="primary"):
+            with st.spinner("Looking up in Registraire des entreprises..."):
+                from connectors.req_connector import REQConnector, REQAnalyzer
+                connector = REQConnector()
+                result = connector.lookup_and_validate(cid, sel, known_neq or None)
+            
+            if result.get("found"):
+                st.success("✓ Company found in REQ")
+                
+                req_data = result.get("req_data", {})
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.markdown("**Registry Information**")
+                    st.write(f"**NEQ:** {result.get('neq', '—')}")
+                    st.write(f"**Legal Name:** {req_data.get('legal_name', '—')}")
+                    st.write(f"**Legal Form:** {req_data.get('legal_form', '—')}")
+                    st.write(f"**Incorporated:** {req_data.get('incorporation_date', '—')}")
+                
+                with col2:
+                    st.markdown("**Status & Address**")
+                    status = req_data.get('status', 'unknown')
+                    status_color = {'active': '🟢', 'struck_off': '🔴', 'dissolved': '⚫'}.get(status, '⚪')
+                    st.write(f"**Status:** {status_color} {status.replace('_', ' ').title()}")
+                    st.write(f"**Address:** {req_data.get('registered_address', '—')}")
+                
+                # Validation flags
+                validation = result.get("validation", {})
+                flags = validation.get("flags", [])
+                
+                if flags:
+                    st.markdown("---")
+                    st.markdown("### ⚠️ Validation Flags")
+                    for flag in flags:
+                        severity_icon = {'critical': '🔴', 'high': '🟠', 'low': '🟡', 'info': 'ℹ️'}.get(flag.get('severity'), '⚪')
+                        st.markdown(f"{severity_icon} **{flag.get('type', '').replace('_', ' ').title()}**: {flag.get('message', '')}")
+                else:
+                    st.success("✓ No validation issues detected")
+                
+                # Directors
+                directors = req_data.get("directors", [])
+                if directors:
+                    st.markdown("---")
+                    st.markdown("### Directors on Record")
+                    for d in directors[:10]:
+                        st.write(f"• **{d.get('name', '—')}** — {d.get('role', 'Director')}")
+            else:
+                st.warning("Company not found in REQ. It may be incorporated outside Quebec or use a different legal name.")
+    
+    # TAB 3: BATCH VALIDATE
+    with tab3:
+        if not req_ok:
+            st.warning("REQ module not available")
+            return
+        
+        st.markdown("### Batch REQ Validation")
+        st.markdown("Validate multiple companies against the Quebec registry")
+        st.warning("⚠️ REQ has rate limits. Batch validation is slow (~3s per company).")
+        
+        conn = get_connection()
+        companies = clean_df(pd.read_sql("""
+            SELECT c.company_id, c.name, c.pipeline_stage,
+                   (SELECT MAX(scraped_date) FROM req_records r WHERE r.company_id = c.company_id) as last_validated
+            FROM companies c 
+            ORDER BY c.name
+        """, conn))
+        conn.close()
+        
+        if len(companies) == 0:
+            st.info("Import companies first")
+            return
+        
+        # Filters
+        col1, col2 = st.columns(2)
+        with col1:
+            pipelines = ["All"] + companies['pipeline_stage'].dropna().unique().tolist()
+            sel_pipeline = st.selectbox("Filter by Pipeline", pipelines, key="req_batch_pipeline")
+        with col2:
+            only_unvalidated = st.checkbox("Only unvalidated companies", value=True)
+        
+        filtered = companies.copy()
+        if sel_pipeline != "All":
+            filtered = filtered[filtered['pipeline_stage'] == sel_pipeline]
+        if only_unvalidated:
+            filtered = filtered[filtered['last_validated'].isna()]
+        
+        st.write(f"**{len(filtered)} companies** match criteria")
+        
+        if len(filtered) > 0:
+            max_validate = st.slider("Companies to validate", 1, min(20, len(filtered)), min(5, len(filtered)))
+            
+            if st.button("🚀 Start Batch Validation", type="primary"):
+                from connectors.req_connector import REQConnector
+                connector = REQConnector()
+                
+                progress = st.progress(0)
+                status = st.empty()
+                results = []
+                
+                for idx, (_, company) in enumerate(filtered.head(max_validate).iterrows()):
+                    progress.progress((idx + 1) / max_validate)
+                    status.text(f"Validating {idx + 1}/{max_validate}: {company['name']}")
+                    
+                    try:
+                        result = connector.lookup_and_validate(company['company_id'], company['name'])
+                        results.append({
+                            'name': company['name'],
+                            'found': '✓' if result.get('found') else '✗',
+                            'neq': result.get('neq', '—'),
+                            'status': result.get('req_data', {}).get('status', '—') if result.get('found') else '—',
+                            'flags': len(result.get('validation', {}).get('flags', []))
+                        })
+                    except Exception as e:
+                        results.append({
+                            'name': company['name'],
+                            'found': '✗',
+                            'neq': '—',
+                            'status': f'Error: {str(e)[:20]}',
+                            'flags': 0
+                        })
+                
+                progress.progress(1.0)
+                status.text("Complete!")
+                
+                st.success(f"Validated {len(results)} companies")
+                results_df = pd.DataFrame(results)
+                st.dataframe(results_df, hide_index=True)
+
+# ============================================================================
+# PAGE: SR&ED / R&D TRACKER
+# ============================================================================
+
+def page_sred():
+    st.markdown("# 🔬 R&D Intelligence")
+    st.markdown("Track SR&ED / CDAE signals and R&D activity")
+    
+    try:
+        from connectors.sred_tracker import SREDTracker, SREDAnalyzer
+        sred_ok = True
+    except Exception as e:
+        sred_ok = False
+        st.error(f"⚠️ SR&ED module error: {str(e)}")
+    
+    tab1, tab2, tab3 = st.tabs(["📊 R&D Dashboard", "🔍 Analyze Company", "⚡ Batch Scan"])
+    
+    # TAB 1: R&D DASHBOARD
+    with tab1:
+        st.markdown("### Portfolio R&D Overview")
+        
+        conn = get_connection()
+        try:
+            df = pd.read_sql("""
+                SELECT 
+                    s.company_id,
+                    c.name,
+                    c.iq_sector,
+                    c.pipeline_stage,
+                    c.employees,
+                    s.sred_mentioned,
+                    s.cdae_mentioned,
+                    s.rd_jobs_count,
+                    s.estimated_rd_spend,
+                    s.estimated_rd_headcount,
+                    s.rd_intensity_score,
+                    s.confidence,
+                    s.scan_date
+                FROM sred_signals s
+                JOIN companies c ON s.company_id = c.company_id
+                WHERE s.id IN (
+                    SELECT MAX(id) FROM sred_signals GROUP BY company_id
+                )
+                ORDER BY s.rd_intensity_score DESC
+            """, conn)
+            df = clean_df(df)
+        except Exception as e:
+            df = pd.DataFrame()
+        conn.close()
+        
+        if len(df) == 0:
+            st.info("No R&D scans yet. Use 'Analyze Company' or 'Batch Scan' to collect data.")
+        else:
+            # Summary metrics
+            col1, col2, col3, col4, col5 = st.columns(5)
+            with col1:
+                render_metric_card(len(df), "Companies Scanned")
+            with col2:
+                sred_likely = len(df[df['sred_mentioned'] == 1])
+                render_metric_card(sred_likely, "SR&ED Likely")
+            with col3:
+                cdae_likely = len(df[df['cdae_mentioned'] == 1])
+                render_metric_card(cdae_likely, "CDAE Likely")
+            with col4:
+                total_rd = df['estimated_rd_spend'].sum() or 0
+                render_metric_card(f"${total_rd/1e6:.1f}M", "Est. R&D Spend")
+            with col5:
+                avg_intensity = df['rd_intensity_score'].mean() or 0
+                render_metric_card(f"{avg_intensity:.0f}", "Avg R&D Score")
+            
+            st.markdown("---")
+            
+            # Top R&D companies
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                top_rd = df.nlargest(10, 'rd_intensity_score')
+                fig = go.Figure(go.Bar(
+                    y=top_rd['name'],
+                    x=top_rd['rd_intensity_score'],
+                    orientation='h',
+                    marker_color='#7c3aed',
+                    text=top_rd['rd_intensity_score'].astype(int),
+                    textposition='inside',
+                    textfont=dict(color='white', size=12)
+                ))
+                fig.update_layout(
+                    title=dict(text="Top R&D Intensity Companies", font=dict(color=NAVY, size=14)),
+                    paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+                    height=400, margin=dict(l=20, r=20, t=40, b=20),
+                    yaxis=dict(autorange='reversed', tickfont=dict(color=NAVY, size=11)),
+                    xaxis=dict(tickfont=dict(color=NAVY, size=11), gridcolor='#e5e7eb', title="R&D Score"),
+                    font_color=NAVY
+                )
+                st.plotly_chart(fig, use_container_width=True)
+            
+            with col2:
+                # R&D spend by sector
+                sector_rd = df.groupby('iq_sector')['estimated_rd_spend'].sum().sort_values(ascending=False).head(8)
+                if len(sector_rd) > 0:
+                    fig = go.Figure(go.Bar(
+                        x=sector_rd.index,
+                        y=sector_rd.values / 1e6,
+                        marker_color='#00875a',
+                        text=[f"${v/1e6:.1f}M" for v in sector_rd.values],
+                        textposition='outside',
+                        textfont=dict(color=NAVY, size=10)
+                    ))
+                    fig.update_layout(
+                        title=dict(text="Estimated R&D Spend by Sector", font=dict(color=NAVY, size=14)),
+                        paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+                        height=400, margin=dict(l=20, r=20, t=40, b=80),
+                        xaxis=dict(tickfont=dict(color=NAVY, size=9), tickangle=45),
+                        yaxis=dict(tickfont=dict(color=NAVY, size=11), gridcolor='#e5e7eb', title="$ Millions"),
+                        font_color=NAVY
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+            
+            # SR&ED/CDAE candidates
+            st.markdown("### 🎯 Tax Credit Candidates")
+            
+            sred_companies = df[(df['sred_mentioned'] == 1) | (df['cdae_mentioned'] == 1) | (df['rd_intensity_score'] >= 50)]
+            if len(sred_companies) > 0:
+                for _, row in sred_companies.head(10).iterrows():
+                    badges = []
+                    if row.get('sred_mentioned') == 1:
+                        badges.append("🔬 SR&ED")
+                    if row.get('cdae_mentioned') == 1:
+                        badges.append("💻 CDAE")
+                    if row.get('rd_intensity_score', 0) >= 70:
+                        badges.append("🔥 High R&D")
+                    
+                    badge_str = " ".join(badges) if badges else "📊"
+                    spend = row.get('estimated_rd_spend') or 0
+                    spend_str = f"~${spend/1e6:.1f}M R&D" if spend > 0 else ""
+                    
+                    st.markdown(f"**{row['name']}** {badge_str} — Score: {row['rd_intensity_score']:.0f} {spend_str}")
+            else:
+                st.info("Run more scans to identify tax credit candidates")
+            
+            # Full table
+            st.markdown("### All Scanned Companies")
+            display_df = df[['name', 'iq_sector', 'rd_intensity_score', 'estimated_rd_headcount', 'estimated_rd_spend', 'confidence']].copy()
+            display_df['estimated_rd_spend'] = display_df['estimated_rd_spend'].apply(lambda x: f"${x/1e6:.2f}M" if pd.notna(x) and x > 0 else "—")
+            display_df.columns = ['Company', 'Sector', 'R&D Score', 'R&D Headcount', 'Est. R&D Spend', 'Confidence']
+            st.dataframe(display_df, use_container_width=True, hide_index=True)
+    
+    # TAB 2: ANALYZE COMPANY
+    with tab2:
+        if not sred_ok:
+            st.warning("SR&ED module not available")
+            return
+        
+        st.markdown("### Analyze R&D Activity")
+        
+        conn = get_connection()
+        companies = clean_df(pd.read_sql("SELECT company_id, name, description, iq_sector, employees FROM companies ORDER BY name", conn))
+        conn.close()
+        
+        if len(companies) == 0:
+            st.info("Import companies first")
+            return
+        
+        opts = {r['name']: r['company_id'] for _, r in companies.iterrows()}
+        sel = st.selectbox("Select Company", list(opts.keys()), key="sred_company")
+        cid = opts[sel]
+        
+        c_row = companies[companies['company_id'] == cid].iloc[0]
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.write(f"**Sector:** {c_row.get('iq_sector', '—')}")
+        with col2:
+            st.write(f"**Employees:** {c_row.get('employees', '—')}")
+        
+        if st.button("🔬 Analyze R&D Activity", type="primary"):
+            with st.spinner("Analyzing R&D signals..."):
+                from connectors.sred_tracker import SREDTracker
+                tracker = SREDTracker()
+                
+                # Get job titles if available
+                conn = get_connection()
+                try:
+                    jobs_df = pd.read_sql("""
+                        SELECT title FROM job_postings
+                        WHERE company_id = ?
+                        ORDER BY scraped_date DESC LIMIT 50
+                    """, conn, params=(cid,))
+                    job_titles = jobs_df['title'].tolist() if len(jobs_df) > 0 else []
+                except:
+                    job_titles = []
+                conn.close()
+                
+                result = tracker.scan_company(
+                    company_id=cid,
+                    company_name=sel,
+                    description=c_row.get('description'),
+                    sector=c_row.get('iq_sector'),
+                    employees=c_row.get('employees'),
+                    job_titles=job_titles
+                )
+            
+            st.success("✓ Analysis complete!")
+            
+            # R&D Score gauge
+            score = result.get('rd_intensity_score', 0)
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.metric("R&D Intensity Score", f"{score}/100")
+            with col2:
+                st.metric("Confidence", result.get('confidence', 'low').title())
+            with col3:
+                summary = result.get('summary', {})
+                indicators = []
+                if summary.get('sred_mentioned'): indicators.append("SR&ED")
+                if summary.get('cdae_mentioned'): indicators.append("CDAE")
+                st.metric("Tax Credits Detected", ", ".join(indicators) if indicators else "None")
+            
+            st.markdown("---")
+            
+            # Estimates
+            estimates = result.get('estimates', {})
+            if estimates.get('rd_spend_annual'):
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Est. R&D Headcount", estimates.get('rd_headcount', 0))
+                with col2:
+                    spend = estimates.get('rd_spend_annual', 0)
+                    st.metric("Est. Annual R&D Spend", f"${spend/1e6:.2f}M")
+                with col3:
+                    sred_credit = estimates.get('sred_credit_potential', 0)
+                    st.metric("Potential SR&ED Credit", f"${sred_credit/1e3:.0f}K/yr")
+                with col4:
+                    cdae_credit = estimates.get('cdae_credit_potential', 0)
+                    if cdae_credit:
+                        st.metric("Potential CDAE Credit", f"${cdae_credit/1e3:.0f}K/yr")
+                    else:
+                        st.metric("Potential CDAE Credit", "N/A")
+            
+            # Signals
+            signals = result.get('signals', [])
+            if signals:
+                st.markdown("### 📡 Signals Detected")
+                for sig in signals:
+                    weight_icon = {'high': '🔴', 'medium': '🟡', 'low': '🟢'}.get(sig.get('weight', 'low'), '⚪')
+                    st.markdown(f"{weight_icon} **{sig.get('type', '').replace('_', ' ').title()}**: {sig.get('detail', '')}")
+    
+    # TAB 3: BATCH SCAN
+    with tab3:
+        if not sred_ok:
+            st.warning("SR&ED module not available")
+            return
+        
+        st.markdown("### Batch R&D Analysis")
+        st.markdown("Scan multiple companies for R&D activity and tax credit potential")
+        
+        conn = get_connection()
+        companies = clean_df(pd.read_sql("""
+            SELECT c.company_id, c.name, c.iq_sector, c.pipeline_stage, c.employees,
+                   (SELECT MAX(scan_date) FROM sred_signals s WHERE s.company_id = c.company_id) as last_scan
+            FROM companies c 
+            ORDER BY c.name
+        """, conn))
+        conn.close()
+        
+        if len(companies) == 0:
+            st.info("Import companies first")
+            return
+        
+        # Filters
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            sectors = ["All"] + companies['iq_sector'].dropna().unique().tolist()
+            sel_sector = st.selectbox("Filter by Sector", sectors, key="sred_batch_sector")
+        with col2:
+            pipelines = ["All"] + companies['pipeline_stage'].dropna().unique().tolist()
+            sel_pipeline = st.selectbox("Filter by Pipeline", pipelines, key="sred_batch_pipeline")
+        with col3:
+            only_unscanned = st.checkbox("Only unscanned companies", value=True, key="sred_only_unscanned")
+        
+        filtered = companies.copy()
+        if sel_sector != "All":
+            filtered = filtered[filtered['iq_sector'] == sel_sector]
+        if sel_pipeline != "All":
+            filtered = filtered[filtered['pipeline_stage'] == sel_pipeline]
+        if only_unscanned:
+            filtered = filtered[filtered['last_scan'].isna()]
+        
+        st.write(f"**{len(filtered)} companies** match criteria")
+        
+        if len(filtered) > 0:
+            max_scan = st.slider("Companies to scan", 1, min(50, len(filtered)), min(20, len(filtered)), key="sred_max")
+            
+            if st.button("🚀 Start R&D Scan", type="primary"):
+                from connectors.sred_tracker import SREDTracker
+                tracker = SREDTracker()
+                
+                progress = st.progress(0)
+                status = st.empty()
+                results = []
+                
+                conn = get_connection()
+                
+                for idx, (_, company) in enumerate(filtered.head(max_scan).iterrows()):
+                    progress.progress((idx + 1) / max_scan)
+                    status.text(f"Scanning {idx + 1}/{max_scan}: {company['name']}")
+                    
+                    try:
+                        # Get job titles
+                        try:
+                            jobs_df = pd.read_sql("""
+                                SELECT title FROM job_postings
+                                WHERE company_id = ? LIMIT 50
+                            """, conn, params=(company['company_id'],))
+                            job_titles = jobs_df['title'].tolist() if len(jobs_df) > 0 else []
+                        except:
+                            job_titles = []
+                        
+                        result = tracker.scan_company(
+                            company_id=company['company_id'],
+                            company_name=company['name'],
+                            sector=company.get('iq_sector'),
+                            employees=company.get('employees'),
+                            job_titles=job_titles
+                        )
+                        
+                        results.append({
+                            'name': company['name'],
+                            'sector': company.get('iq_sector', '—'),
+                            'rd_score': result.get('rd_intensity_score', 0),
+                            'sred': '✓' if result.get('summary', {}).get('sred_mentioned') else '',
+                            'cdae': '✓' if result.get('summary', {}).get('cdae_mentioned') else '',
+                            'confidence': result.get('confidence', 'low')
+                        })
+                    except Exception as e:
+                        results.append({
+                            'name': company['name'],
+                            'sector': company.get('iq_sector', '—'),
+                            'rd_score': 0,
+                            'sred': '',
+                            'cdae': '',
+                            'confidence': f'Error: {str(e)[:15]}'
+                        })
+                
+                conn.close()
+                progress.progress(1.0)
+                status.text("Complete!")
+                
+                st.success(f"Scanned {len(results)} companies")
+                
+                results_df = pd.DataFrame(results).sort_values('rd_score', ascending=False)
+                st.dataframe(results_df, hide_index=True)
+                
+                # Summary
+                high_rd = len([r for r in results if r['rd_score'] >= 50])
+                sred_count = len([r for r in results if r['sred'] == '✓'])
+                st.markdown(f"**Found:** {high_rd} high R&D companies, {sred_count} SR&ED mentions")
+
+# ============================================================================
 # MAIN
 # ============================================================================
 
@@ -1315,15 +2246,25 @@ def main():
     with st.sidebar:
         st.markdown('<div class="logo-container"><div class="logo-text">◆ QC Pipeline</div><div class="logo-subtext">Deal Flow Tracker</div></div>', unsafe_allow_html=True)
         
+        st.markdown("**PIPELINE**", unsafe_allow_html=True)
         if st.button("📊 Overview", use_container_width=True): st.session_state['page'] = 'overview'; st.rerun()
         if st.button("🎯 Pipeline", use_container_width=True): st.session_state['page'] = 'pipeline'; st.rerun()
         if st.button("🏢 Companies", use_container_width=True): st.session_state['page'] = 'companies'; st.rerun()
+        
+        st.markdown("**INTELLIGENCE**", unsafe_allow_html=True)
         if st.button("📈 Traction", use_container_width=True): st.session_state['page'] = 'traction'; st.rerun()
+        if st.button("💼 Jobs", use_container_width=True): st.session_state['page'] = 'jobs'; st.rerun()
         if st.button("🔮 Funding Radar", use_container_width=True): st.session_state['page'] = 'funding_radar'; st.rerun()
+        
+        st.markdown("**QUEBEC DATA**", unsafe_allow_html=True)
+        if st.button("🏛️ REQ", use_container_width=True): st.session_state['page'] = 'req'; st.rerun()
+        if st.button("🔬 SR&ED", use_container_width=True): st.session_state['page'] = 'sred'; st.rerun()
+        
+        st.markdown("**SYSTEM**", unsafe_allow_html=True)
         if st.button("⚙️ Settings", use_container_width=True): st.session_state['page'] = 'settings'; st.rerun()
         
         st.markdown("---")
-        st.caption("v3.1 • IQ Edition + Funding Radar")
+        st.caption("v3.3 • Quebec Edition")
     
     p = st.session_state.get('page', 'overview')
     if p == 'overview': page_overview()
@@ -1331,7 +2272,10 @@ def main():
     elif p == 'companies': page_companies()
     elif p == 'detail': page_detail()
     elif p == 'traction': page_traction()
+    elif p == 'jobs': page_jobs()
     elif p == 'funding_radar': page_funding_radar()
+    elif p == 'req': page_req()
+    elif p == 'sred': page_sred()
     elif p == 'settings': page_settings()
 
 if __name__ == "__main__":

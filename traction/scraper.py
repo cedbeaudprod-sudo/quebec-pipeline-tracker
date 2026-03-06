@@ -14,6 +14,7 @@ from urllib.parse import urlparse, quote_plus
 import json
 from typing import Optional, Dict, List, Any, Tuple
 import logging
+import pandas as pd
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -606,10 +607,6 @@ class GrowthScorer:
         
         conn.commit()
         conn.close()
-
-
-# Pandas import for scoring (at module level to avoid issues)
-import pandas as pd
 
 
 # =============================================================================
