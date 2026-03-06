@@ -133,6 +133,11 @@ def init_database():
     c.execute("""CREATE TABLE IF NOT EXISTS activities (id INTEGER PRIMARY KEY, company_id TEXT, activity_type TEXT, description TEXT, created_at TEXT)""")
     c.execute("""CREATE TABLE IF NOT EXISTS traction_snapshots (id INTEGER PRIMARY KEY, company_id TEXT, snapshot_date TEXT, job_postings_count INTEGER, news_mentions_30d INTEGER, news_sentiment_avg REAL, website_status INTEGER, has_blog INTEGER, has_careers_page INTEGER, tech_stack TEXT, github_stars INTEGER, github_forks INTEGER, raw_data TEXT)""")
     c.execute("""CREATE TABLE IF NOT EXISTS growth_scores (id INTEGER PRIMARY KEY, company_id TEXT, score_date TEXT, hiring_velocity_score REAL, funding_momentum_score REAL, news_buzz_score REAL, web_presence_score REAL, tech_activity_score REAL, growth_score REAL, growth_trend TEXT, confidence REAL, factors_positive TEXT, factors_negative TEXT)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS funding_predictions (
+        id INTEGER PRIMARY KEY, company_id TEXT, prediction_date TEXT, estimated_months_to_raise INTEGER,
+        confidence TEXT, predicted_window TEXT, recommended_action TEXT, runway_score REAL, hiring_score REAL,
+        growth_score REAL, market_score REAL, benchmark_score REAL, urgency_score REAL, primary_signals TEXT,
+        all_signals TEXT, next_review_date TEXT)""")
     conn.commit()
     conn.close()
 
@@ -674,6 +679,545 @@ def page_traction():
                 st.dataframe(results_df, hide_index=True)
 
 # ============================================================================
+# PAGE: FUNDING RADAR
+# ============================================================================
+
+def page_funding_radar():
+    st.markdown("# Funding Radar")
+    st.markdown("Predict funding windows and prioritize BD outreach")
+    
+    try:
+        from traction.scraper import FundingPredictor, TractionScraper
+        predictor_ok = True
+    except ImportError:
+        predictor_ok = False
+        st.warning("⚠️ Install dependencies: `pip install beautifulsoup4 feedparser requests`")
+    
+    tab1, tab2, tab3, tab4 = st.tabs(["🎯 Priority Queue", "🔮 Analyze Company", "⚡ Batch Predict", "📊 Insights"])
+    
+    # TAB 1: PRIORITY QUEUE
+    with tab1:
+        st.markdown("### Companies Most Likely to Raise Soon")
+        st.markdown("Ranked by urgency score — focus your BD efforts on the top companies")
+        
+        conn = get_connection()
+        try:
+            df = pd.read_sql("""
+                SELECT 
+                    fp.company_id,
+                    c.name,
+                    c.iq_sector,
+                    c.pipeline_stage,
+                    c.total_raised,
+                    c.employees,
+                    c.last_financing_date,
+                    fp.estimated_months_to_raise,
+                    fp.confidence,
+                    fp.predicted_window,
+                    fp.recommended_action,
+                    fp.urgency_score,
+                    fp.runway_score,
+                    fp.hiring_score,
+                    fp.growth_score,
+                    fp.primary_signals,
+                    fp.prediction_date
+                FROM funding_predictions fp
+                JOIN companies c ON fp.company_id = c.company_id
+                WHERE fp.id IN (
+                    SELECT MAX(id) FROM funding_predictions GROUP BY company_id
+                )
+                ORDER BY fp.urgency_score DESC
+            """, conn)
+            df = clean_df(df)
+        except Exception as e:
+            df = pd.DataFrame()
+        conn.close()
+        
+        if len(df) == 0:
+            st.info("No predictions yet. Use 'Analyze Company' or 'Batch Predict' to generate funding predictions.")
+        else:
+            # Summary metrics
+            col1, col2, col3, col4, col5 = st.columns(5)
+            with col1: 
+                priority_count = len(df[df['recommended_action'] == 'priority_bd'])
+                render_metric_card(priority_count, "Priority BD")
+            with col2: 
+                warm_count = len(df[df['recommended_action'] == 'warm_outreach'])
+                render_metric_card(warm_count, "Warm Outreach")
+            with col3:
+                avg_months = df['estimated_months_to_raise'].mean()
+                render_metric_card(f"{avg_months:.1f}", "Avg Months to Raise")
+            with col4:
+                high_conf = len(df[df['confidence'] == 'high'])
+                render_metric_card(high_conf, "High Confidence")
+            with col5:
+                render_metric_card(len(df), "Total Predicted")
+            
+            st.markdown("---")
+            
+            # Action filter
+            col1, col2, col3 = st.columns([2, 2, 2])
+            with col1:
+                action_filter = st.selectbox("Filter by Action", ["All", "priority_bd", "warm_outreach", "monitor", "watch", "low_priority"])
+            with col2:
+                confidence_filter = st.selectbox("Filter by Confidence", ["All", "high", "medium", "low"])
+            with col3:
+                months_filter = st.slider("Max Months to Raise", 1, 24, 12)
+            
+            filtered_df = df.copy()
+            if action_filter != "All":
+                filtered_df = filtered_df[filtered_df['recommended_action'] == action_filter]
+            if confidence_filter != "All":
+                filtered_df = filtered_df[filtered_df['confidence'] == confidence_filter]
+            filtered_df = filtered_df[filtered_df['estimated_months_to_raise'] <= months_filter]
+            
+            st.markdown(f"**{len(filtered_df)} companies** match your criteria")
+            
+            # Priority Queue Cards
+            for idx, row in filtered_df.head(20).iterrows():
+                with st.container():
+                    col1, col2, col3, col4, col5 = st.columns([3, 1.5, 1.5, 2, 1])
+                    
+                    # Company info
+                    with col1:
+                        name = safe_str(row.get('name')) or '—'
+                        sector = safe_str(row.get('iq_sector')) or ''
+                        pipeline = safe_str(row.get('pipeline_stage')) or 'Prospect'
+                        
+                        action = row.get('recommended_action', '')
+                        action_colors = {
+                            'priority_bd': '#dc2626',
+                            'warm_outreach': '#d97706',
+                            'monitor': '#0052cc',
+                            'watch': '#697386',
+                            'low_priority': '#97a0af'
+                        }
+                        action_color = action_colors.get(action, '#697386')
+                        
+                        st.markdown(f"""
+                        <div style="padding: 0.5rem 0;">
+                            <span style="font-weight: 600; color: #1a1f36; font-size: 1rem;">{name}</span>
+                            <span style="background: {action_color}; color: white; padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.7rem; font-weight: 600; margin-left: 0.5rem;">{action.upper().replace('_', ' ')}</span>
+                            <br><span class="tag tag-sector">{sector}</span><span class="tag tag-stage">{pipeline}</span>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    
+                    # Timing
+                    with col2:
+                        months = row.get('estimated_months_to_raise', 0)
+                        window = safe_str(row.get('predicted_window')) or '—'
+                        st.markdown(f"**{months} mo**<br><span style='color: #697386; font-size: 0.8rem;'>{window}</span>", unsafe_allow_html=True)
+                    
+                    # Scores
+                    with col3:
+                        urgency = row.get('urgency_score', 0)
+                        confidence = safe_str(row.get('confidence')) or 'low'
+                        conf_colors = {'high': '#00875a', 'medium': '#d97706', 'low': '#697386'}
+                        st.markdown(f"**{urgency:.0f}**/100<br><span style='color: {conf_colors.get(confidence, '#697386')}; font-size: 0.8rem;'>{confidence.upper()} conf.</span>", unsafe_allow_html=True)
+                    
+                    # Top signal
+                    with col4:
+                        try:
+                            signals_raw = row.get('primary_signals', '[]')
+                            if isinstance(signals_raw, bytes):
+                                signals_raw = signals_raw.decode('utf-8')
+                            signals = json.loads(signals_raw) if signals_raw else []
+                            if signals:
+                                top_signal = signals[0].get('detail', '')[:50]
+                                st.markdown(f"<span style='font-size: 0.85rem; color: #3c4257;'>📍 {top_signal}...</span>", unsafe_allow_html=True)
+                            else:
+                                st.markdown("<span style='color: #697386;'>No signals</span>", unsafe_allow_html=True)
+                        except:
+                            st.markdown("<span style='color: #697386;'>—</span>", unsafe_allow_html=True)
+                    
+                    # Action button
+                    with col5:
+                        if st.button("View", key=f"fr_{row['company_id']}"):
+                            st.session_state['selected_company'] = row['company_id']
+                            st.session_state['page'] = 'detail'
+                            st.rerun()
+                    
+                    st.markdown("<hr style='margin: 0.5rem 0; border-color: #e5e7eb;'>", unsafe_allow_html=True)
+    
+    # TAB 2: ANALYZE COMPANY
+    with tab2:
+        if not predictor_ok:
+            st.warning("Predictor module not available")
+            return
+        
+        st.markdown("### Predict Funding Window for a Company")
+        
+        conn = get_connection()
+        companies = clean_df(pd.read_sql("SELECT company_id, name, iq_sector, last_financing_date, total_raised FROM companies ORDER BY name", conn))
+        conn.close()
+        
+        if len(companies) == 0:
+            st.info("Import companies first")
+            return
+        
+        opts = {f"{r['name']} ({safe_str(r['iq_sector']) or 'No sector'})": r['company_id'] for _, r in companies.iterrows()}
+        sel = st.selectbox("Select Company", list(opts.keys()))
+        cid = opts[sel]
+        c = get_company(cid)
+        
+        if c is not None:
+            col1, col2, col3, col4 = st.columns(4)
+            with col1: 
+                raised = c.get('total_raised')
+                st.write(f"**Total Raised:** ${raised:.1f}M" if pd.notna(raised) else "**Total Raised:** —")
+            with col2: 
+                st.write(f"**Last Financing:** {safe_str(c.get('last_financing_date')) or '—'}")
+            with col3:
+                st.write(f"**Employees:** {c.get('employees') or '—'}")
+            with col4:
+                st.write(f"**Stage:** {safe_str(c.get('stage_entreprise')) or '—'}")
+        
+        if st.button("🔮 Predict Funding Window", type="primary"):
+            with st.spinner("Analyzing funding signals..."):
+                from traction.scraper import FundingPredictor
+                predictor = FundingPredictor()
+                prediction = predictor.predict_funding_window(cid)
+            
+            if "error" in prediction:
+                st.error(prediction["error"])
+            else:
+                st.success("✓ Prediction complete!")
+                
+                # Main prediction display
+                st.markdown("---")
+                col1, col2, col3, col4 = st.columns(4)
+                
+                with col1:
+                    months = prediction.get('estimated_months_to_raise', 0)
+                    st.metric("Estimated Time to Raise", f"{months} months")
+                
+                with col2:
+                    window = prediction.get('predicted_window', '—')
+                    st.metric("Predicted Window", window)
+                
+                with col3:
+                    confidence = prediction.get('confidence', 'low').upper()
+                    st.metric("Confidence", confidence)
+                
+                with col4:
+                    action = prediction.get('recommended_action', '').replace('_', ' ').title()
+                    st.metric("Recommended Action", action)
+                
+                # Score breakdown
+                st.markdown("### Score Breakdown")
+                scores = prediction.get('scores', {})
+                
+                col1, col2 = st.columns(2)
+                
+                with col1:
+                    # Radar chart for scores
+                    categories = ['Runway', 'Hiring', 'Growth', 'Market', 'Benchmark']
+                    values = [
+                        scores.get('runway', 0),
+                        scores.get('hiring', 0),
+                        scores.get('growth', 0),
+                        scores.get('market', 0),
+                        scores.get('benchmark', 0)
+                    ]
+                    
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatterpolar(
+                        r=values + [values[0]],
+                        theta=categories + [categories[0]],
+                        fill='toself',
+                        fillcolor='rgba(0, 135, 90, 0.2)',
+                        line=dict(color='#00875a', width=2),
+                        name='Score'
+                    ))
+                    fig.update_layout(
+                        polar=dict(
+                            radialaxis=dict(visible=True, range=[0, 100], tickfont=dict(color=NAVY, size=10)),
+                            angularaxis=dict(tickfont=dict(color=NAVY, size=11))
+                        ),
+                        showlegend=False,
+                        height=350,
+                        margin=dict(l=60, r=60, t=30, b=30),
+                        paper_bgcolor='rgba(0,0,0,0)',
+                        font_color=NAVY
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+                
+                with col2:
+                    st.markdown("**Component Scores**")
+                    for name, value in scores.items():
+                        if name != 'urgency':
+                            st.progress(min(value/100, 1.0), text=f"{name.replace('_', ' ').title()}: {value:.0f}/100")
+                    
+                    st.markdown(f"**Overall Urgency Score: {scores.get('urgency', 0):.0f}/100**")
+                
+                # Signals
+                st.markdown("### Key Signals")
+                col1, col2 = st.columns(2)
+                
+                all_signals = prediction.get('all_signals', [])
+                high_signals = [s for s in all_signals if s.get('weight') == 'high']
+                other_signals = [s for s in all_signals if s.get('weight') != 'high']
+                
+                with col1:
+                    st.markdown("**🔴 High-Weight Signals**")
+                    if high_signals:
+                        for sig in high_signals:
+                            st.markdown(f"• **{sig.get('type', '').replace('_', ' ').title()}**: {sig.get('detail', '')}")
+                    else:
+                        st.write("No high-weight signals detected")
+                
+                with col2:
+                    st.markdown("**🟡 Other Signals**")
+                    if other_signals:
+                        for sig in other_signals[:5]:
+                            st.markdown(f"• {sig.get('type', '').replace('_', ' ').title()}: {sig.get('detail', '')}")
+                    else:
+                        st.write("No additional signals")
+    
+    # TAB 3: BATCH PREDICT
+    with tab3:
+        if not predictor_ok:
+            st.warning("Predictor module not available")
+            return
+        
+        st.markdown("### Batch Funding Predictions")
+        st.markdown("Run predictions for multiple companies to build your priority queue")
+        
+        conn = get_connection()
+        companies = clean_df(pd.read_sql("""
+            SELECT c.company_id, c.name, c.iq_sector, c.pipeline_stage, c.last_financing_date,
+                   (SELECT MAX(prediction_date) FROM funding_predictions fp WHERE fp.company_id = c.company_id) as last_prediction
+            FROM companies c 
+            ORDER BY c.name
+        """, conn))
+        conn.close()
+        
+        if len(companies) == 0:
+            st.info("Import companies first")
+            return
+        
+        # Filters
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            sectors = ["All"] + companies['iq_sector'].dropna().unique().tolist()
+            sel_sector = st.selectbox("Filter by Sector", sectors, key="batch_pred_sector")
+        with col2:
+            pipelines = ["All"] + companies['pipeline_stage'].dropna().unique().tolist()
+            sel_pipeline = st.selectbox("Filter by Pipeline", pipelines, key="batch_pred_pipeline")
+        with col3:
+            only_unpredicted = st.checkbox("Only companies without predictions", value=True)
+        
+        filtered = companies.copy()
+        if sel_sector != "All":
+            filtered = filtered[filtered['iq_sector'] == sel_sector]
+        if sel_pipeline != "All":
+            filtered = filtered[filtered['pipeline_stage'] == sel_pipeline]
+        if only_unpredicted:
+            filtered = filtered[filtered['last_prediction'].isna()]
+        
+        st.write(f"**{len(filtered)} companies** match criteria")
+        
+        if len(filtered) > 0:
+            max_predict = st.slider("Companies to predict", 1, min(50, len(filtered)), min(20, len(filtered)))
+            
+            # Preview
+            preview_df = filtered.head(max_predict)[['name', 'iq_sector', 'pipeline_stage', 'last_financing_date', 'last_prediction']]
+            preview_df.columns = ['Company', 'Sector', 'Pipeline', 'Last Financing', 'Last Prediction']
+            st.dataframe(preview_df, hide_index=True)
+            
+            if st.button("🚀 Run Batch Predictions", type="primary"):
+                from traction.scraper import FundingPredictor, TractionScraper
+                predictor = FundingPredictor()
+                scraper = TractionScraper()
+                
+                progress = st.progress(0)
+                status = st.empty()
+                results = []
+                
+                for idx, (_, company) in enumerate(filtered.head(max_predict).iterrows()):
+                    progress.progress((idx + 1) / max_predict)
+                    status.text(f"Predicting {idx + 1}/{max_predict}: {company['name']}")
+                    
+                    try:
+                        # First ensure we have traction data
+                        c = get_company(company['company_id'])
+                        if c is not None:
+                            website = safe_str(c.get('website'))
+                            scraper.collect_traction_snapshot(company['company_id'], company['name'], website)
+                        
+                        # Then predict
+                        prediction = predictor.predict_funding_window(company['company_id'])
+                        
+                        if "error" not in prediction:
+                            results.append({
+                                'name': company['name'],
+                                'months': prediction.get('estimated_months_to_raise', 0),
+                                'action': prediction.get('recommended_action', ''),
+                                'confidence': prediction.get('confidence', ''),
+                                'urgency': prediction.get('scores', {}).get('urgency', 0),
+                                'status': '✓'
+                            })
+                        else:
+                            results.append({'name': company['name'], 'months': 0, 'action': '', 'confidence': '', 'urgency': 0, 'status': '✗ No data'})
+                    except Exception as e:
+                        results.append({'name': company['name'], 'months': 0, 'action': '', 'confidence': '', 'urgency': 0, 'status': f'✗ {str(e)[:20]}'})
+                
+                progress.progress(1.0)
+                status.text("Complete!")
+                
+                st.success(f"Predicted {len(results)} companies")
+                
+                # Results summary
+                results_df = pd.DataFrame(results).sort_values('urgency', ascending=False)
+                st.dataframe(results_df, hide_index=True)
+                
+                # Quick stats
+                priority_count = len([r for r in results if r['action'] == 'priority_bd'])
+                warm_count = len([r for r in results if r['action'] == 'warm_outreach'])
+                st.markdown(f"**Quick Summary:** {priority_count} Priority BD, {warm_count} Warm Outreach, {len(results) - priority_count - warm_count} Others")
+    
+    # TAB 4: INSIGHTS
+    with tab4:
+        st.markdown("### Funding Radar Insights")
+        
+        conn = get_connection()
+        try:
+            df = pd.read_sql("""
+                SELECT 
+                    fp.*,
+                    c.name,
+                    c.iq_sector,
+                    c.pipeline_stage
+                FROM funding_predictions fp
+                JOIN companies c ON fp.company_id = c.company_id
+                WHERE fp.id IN (
+                    SELECT MAX(id) FROM funding_predictions GROUP BY company_id
+                )
+            """, conn)
+            df = clean_df(df)
+        except:
+            df = pd.DataFrame()
+        conn.close()
+        
+        if len(df) == 0:
+            st.info("Run some predictions first to see insights")
+            return
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            # Distribution by recommended action
+            action_counts = df['recommended_action'].value_counts()
+            action_colors = {
+                'priority_bd': '#dc2626',
+                'warm_outreach': '#d97706',
+                'monitor': '#0052cc',
+                'watch': '#697386',
+                'low_priority': '#97a0af'
+            }
+            colors = [action_colors.get(a, '#697386') for a in action_counts.index]
+            
+            fig = go.Figure(go.Pie(
+                labels=[a.replace('_', ' ').title() for a in action_counts.index],
+                values=action_counts.values,
+                hole=0.55,
+                marker=dict(colors=colors),
+                textfont=dict(size=11, color=NAVY)
+            ))
+            fig.update_layout(
+                title=dict(text="By Recommended Action", font=dict(color=NAVY, size=14)),
+                paper_bgcolor='rgba(0,0,0,0)',
+                height=350,
+                margin=dict(l=20, r=20, t=40, b=20),
+                legend=dict(font=dict(size=11, color=NAVY))
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        
+        with col2:
+            # Distribution by estimated months
+            fig = go.Figure(go.Histogram(
+                x=df['estimated_months_to_raise'],
+                nbinsx=12,
+                marker_color='#00875a'
+            ))
+            fig.update_layout(
+                title=dict(text="Distribution: Months to Raise", font=dict(color=NAVY, size=14)),
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0)',
+                height=350,
+                margin=dict(l=20, r=20, t=40, b=40),
+                xaxis=dict(title="Months", tickfont=dict(color=NAVY, size=11), gridcolor='#e5e7eb'),
+                yaxis=dict(title="# Companies", tickfont=dict(color=NAVY, size=11), gridcolor='#e5e7eb'),
+                font_color=NAVY
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        
+        st.markdown("---")
+        
+        # Top signals analysis
+        st.markdown("### Most Common Signals")
+        
+        all_signals = []
+        for _, row in df.iterrows():
+            try:
+                signals_raw = row.get('primary_signals', '[]')
+                if isinstance(signals_raw, bytes):
+                    signals_raw = signals_raw.decode('utf-8')
+                signals = json.loads(signals_raw) if signals_raw else []
+                for sig in signals:
+                    all_signals.append(sig.get('type', 'unknown'))
+            except:
+                continue
+        
+        if all_signals:
+            signal_counts = pd.Series(all_signals).value_counts().head(10)
+            
+            fig = go.Figure(go.Bar(
+                y=[s.replace('_', ' ').title() for s in signal_counts.index],
+                x=signal_counts.values,
+                orientation='h',
+                marker_color='#0052cc',
+                text=signal_counts.values,
+                textposition='inside',
+                textfont=dict(color='white', size=12)
+            ))
+            fig.update_layout(
+                title=dict(text="Top Signals Driving Predictions", font=dict(color=NAVY, size=14)),
+                paper_bgcolor='rgba(0,0,0,0)',
+                plot_bgcolor='rgba(0,0,0,0)',
+                height=400,
+                margin=dict(l=20, r=20, t=40, b=20),
+                xaxis=dict(title="Occurrences", tickfont=dict(color=NAVY, size=11), gridcolor='#e5e7eb'),
+                yaxis=dict(autorange='reversed', tickfont=dict(color=NAVY, size=11)),
+                font_color=NAVY
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        
+        # Sector breakdown
+        st.markdown("### By Sector")
+        sector_urgency = df.groupby('iq_sector')['urgency_score'].mean().sort_values(ascending=False).head(10)
+        
+        fig = go.Figure(go.Bar(
+            x=sector_urgency.index,
+            y=sector_urgency.values,
+            marker_color='#00875a',
+            text=[f"{v:.0f}" for v in sector_urgency.values],
+            textposition='outside',
+            textfont=dict(color=NAVY, size=12)
+        ))
+        fig.update_layout(
+            title=dict(text="Average Urgency Score by Sector", font=dict(color=NAVY, size=14)),
+            paper_bgcolor='rgba(0,0,0,0)',
+            plot_bgcolor='rgba(0,0,0,0)',
+            height=350,
+            margin=dict(l=20, r=20, t=40, b=80),
+            xaxis=dict(tickangle=45, tickfont=dict(color=NAVY, size=10)),
+            yaxis=dict(range=[0, 100], tickfont=dict(color=NAVY, size=11), gridcolor='#e5e7eb'),
+            font_color=NAVY
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+# ============================================================================
 # PAGE: SETTINGS (WITH PRE-SCREENING)
 # ============================================================================
 
@@ -775,10 +1319,11 @@ def main():
         if st.button("🎯 Pipeline", use_container_width=True): st.session_state['page'] = 'pipeline'; st.rerun()
         if st.button("🏢 Companies", use_container_width=True): st.session_state['page'] = 'companies'; st.rerun()
         if st.button("📈 Traction", use_container_width=True): st.session_state['page'] = 'traction'; st.rerun()
+        if st.button("🔮 Funding Radar", use_container_width=True): st.session_state['page'] = 'funding_radar'; st.rerun()
         if st.button("⚙️ Settings", use_container_width=True): st.session_state['page'] = 'settings'; st.rerun()
         
         st.markdown("---")
-        st.caption("v3.0 • IQ Edition")
+        st.caption("v3.1 • IQ Edition + Funding Radar")
     
     p = st.session_state.get('page', 'overview')
     if p == 'overview': page_overview()
@@ -786,6 +1331,7 @@ def main():
     elif p == 'companies': page_companies()
     elif p == 'detail': page_detail()
     elif p == 'traction': page_traction()
+    elif p == 'funding_radar': page_funding_radar()
     elif p == 'settings': page_settings()
 
 if __name__ == "__main__":
