@@ -513,9 +513,9 @@ def page_traction():
     try:
         from traction.scraper import TractionScraper, GrowthScorer
         traction_ok = True
-    except ImportError:
+    except Exception as e:
         traction_ok = False
-        st.warning("⚠️ Install dependencies: `pip install beautifulsoup4 feedparser requests`")
+        st.error(f"⚠️ Module load error: {str(e)}")
     
     tab1, tab2, tab3 = st.tabs(["🏆 Top Scores", "🔍 Analyze Company", "⚡ Batch Scan"])
     
@@ -689,9 +689,9 @@ def page_funding_radar():
     try:
         from traction.scraper import FundingPredictor, TractionScraper
         predictor_ok = True
-    except ImportError:
+    except Exception as e:
         predictor_ok = False
-        st.warning("⚠️ Install dependencies: `pip install beautifulsoup4 feedparser requests`")
+        st.error(f"⚠️ Module load error: {str(e)}")
     
     tab1, tab2, tab3, tab4 = st.tabs(["🎯 Priority Queue", "🔮 Analyze Company", "⚡ Batch Predict", "📊 Insights"])
     
